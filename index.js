@@ -27,7 +27,6 @@ function str2ab(pem) {
     .replace(/-----END PRIVATE KEY-----/, '')
     .replace(/\\n/g, '')
     .replace(/[\r\n\s]/g, '');
-
   const binary = atob(clean);
   const buffer = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -98,30 +97,15 @@ async function getAccessToken() {
 function toFirestoreValue(val) {
   if (typeof val === 'number') return { doubleValue: val };
   if (typeof val === 'boolean') return { booleanValue: val };
-  if (Array.isArray(val)) {
-    return {
-      arrayValue: {
-        values: val.map((v) => toFirestoreValue(v)),
-      },
-    };
-  }
-  if (val !== null && typeof val === 'object') {
-    return {
-      mapValue: {
-        fields: Object.fromEntries(
-          Object.entries(val).map(([k, v]) => [k, toFirestoreValue(v)])
-        ),
-      },
-    };
-  }
+  if (Array.isArray(val)) return { arrayValue: { values: val.map((v) => toFirestoreValue(v)) } };
+  if (val !== null && typeof val === 'object')
+    return { mapValue: { fields: Object.fromEntries(Object.entries(val).map(([k, v]) => [k, toFirestoreValue(v)])) } };
   return { stringValue: String(val ?? '') };
 }
 
 function toFirestoreFields(obj) {
   const fields = {};
-  for (const key in obj) {
-    fields[key] = toFirestoreValue(obj[key]);
-  }
+  for (const key in obj) fields[key] = toFirestoreValue(obj[key]);
   return fields;
 }
 
@@ -129,16 +113,11 @@ async function firestoreCreate(collection, data, token) {
   const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${collection}`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ fields: toFirestoreFields(data) }),
   });
-
   const result = await res.json();
   if (!res.ok) throw new Error(`Firestore create failed: ${JSON.stringify(result)}`);
-
   const docName = result.name;
   return docName.split('/').pop();
 }
@@ -146,20 +125,12 @@ async function firestoreCreate(collection, data, token) {
 async function firestoreUpdate(docPath, data, token) {
   const fieldPaths = Object.keys(data).join('&updateMask.fieldPaths=');
   const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${docPath}?updateMask.fieldPaths=${fieldPaths}`;
-
   const res = await fetch(url, {
     method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ fields: toFirestoreFields(data) }),
   });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Firestore update failed: ${err}`);
-  }
+  if (!res.ok) throw new Error(`Firestore update failed: ${await res.text()}`);
 }
 
 // ---------------- HELPERS ----------------
@@ -220,19 +191,16 @@ Required structure:
 }
       `.trim(),
     },
-    {
-      role: 'user',
-      content: JSON.stringify(input),
-    },
+    { role: 'user', content: JSON.stringify(input) },
   ];
 }
 
 // ---------------- VALIDATION ----------------
 function validateWeek(week) {
-  const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
   for (const day of days) {
     if (!week[day]) throw new Error(`Missing day: ${day}`);
-    for (const meal of ['breakfast', 'lunch', 'dinner']) {
+    for (const meal of ['breakfast','lunch','dinner']) {
       if (!week[day][meal]) throw new Error(`Missing ${meal} on ${day}`);
     }
   }
@@ -241,11 +209,9 @@ function validateWeek(week) {
 // ---------------- DAY BUILDER ----------------
 function buildDay(day, imagePromptMap, dayName) {
   const out = {};
-
-  for (const type of ['breakfast', 'lunch', 'dinner']) {
+  for (const type of ['breakfast','lunch','dinner']) {
     const m = day[type];
     const P = type.charAt(0).toUpperCase() + type.slice(1);
-
     out[`${P}Name`] = m.name ?? '';
     out[`${P}Description`] = m.description ?? '';
     out[`${P}Ingredients`] = ensureArray(m.ingredients_used);
@@ -253,25 +219,20 @@ function buildDay(day, imagePromptMap, dayName) {
     out[`${P}Instructions`] = exactly12(m.instructions);
     out[`${P}Equipment`] = ensureArray(m.equipment);
     out[`${type}cost`] = Number(m.estimated_cost) || 0;
-
-    // Image fields left empty — image worker fills these in
     out[`${P}Image`] = '';
     out[`${P}InstructionImages`] = [];
 
-    // Extract image prompts for this meal
+    // Extract image prompts for worker
     if (m.image_prompts) {
       if (!imagePromptMap[dayName]) imagePromptMap[dayName] = {};
       imagePromptMap[dayName][P] = [
         { key: `${P}Meal`, prompt: m.image_prompts.food },
         { key: `${P}Step1`, prompt: m.image_prompts.step_1 },
         { key: `${P}Step5`, prompt: m.image_prompts.step_5 },
-        ...(m.image_prompts.step_9
-          ? [{ key: `${P}Step9`, prompt: m.image_prompts.step_9 }]
-          : []),
+        ...(m.image_prompts.step_9 ? [{ key: `${P}Step9`, prompt: m.image_prompts.step_9 }] : []),
       ];
     }
   }
-
   return out;
 }
 
@@ -280,50 +241,38 @@ async function processInBackground(payload) {
   try {
     const token = await getAccessToken();
 
-    // 1. Create Timetable doc with status "creating"
+    // 1️⃣ Create Timetable doc
     const timetableId = await firestoreCreate(
       'Timetable',
-      {
-        userId: payload.userId,
-        status: 'creating',
-        created_at: new Date().toISOString(),
-      },
+      { userId: payload.userId, status: 'creating', created_at: new Date().toISOString() },
       token
     );
+    console.log('📄 Timetable doc created with ID:', timetableId);
 
-    console.log('📄 Timetable doc created:', timetableId);
-
-    // 2. Call OpenAI
+    // 2️⃣ Call OpenAI
+    console.log('🤖 Calling OpenAI for weekly meal plan...');
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: buildMessages(payload),
-        max_tokens: 7000,
-      }),
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o-mini', messages: buildMessages(payload), max_tokens: 7000 }),
     });
 
     const raw = await res.text();
     if (!res.ok) throw new Error(`OpenAI error: ${raw}`);
+    console.log('✅ OpenAI returned a response');
 
     const openAIResult = JSON.parse(raw);
     const content = openAIResult.choices[0].message.content;
-
-    // Strip markdown fences if present
     const cleaned = content.replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(cleaned);
     const week = parsed.weekly_meal_plan;
 
-    // 3. Validate all 7 days present
+    // 3️⃣ Validate week
     validateWeek(week);
+    console.log('📅 Weekly meal plan validated');
 
-    // 4. Build timetable data + extract image prompts
+    // 4️⃣ Build timetable data + extract image prompts
     const promptsByDay = {};
-
     const timetableData = {
       Sunday: buildDay(week.sunday, promptsByDay, 'Sunday'),
       Monday: buildDay(week.monday, promptsByDay, 'Monday'),
@@ -335,19 +284,28 @@ async function processInBackground(payload) {
       status: 'completed',
       updated_at: new Date().toISOString(),
     };
+    console.log('🛠️ Timetable data built. Prompts extracted for image generation');
 
-    // 5. Save meal plan to Firestore
+    // 5️⃣ Save meal plan to Firestore
     await firestoreUpdate(`Timetable/${timetableId}`, timetableData, token);
     console.log('✅ Meal plan saved to Firestore:', timetableId);
 
-    // 6. Call image worker with the extracted prompts
-    await fetch(IMAGE_WORKER_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ timetableId, promptsByDay }),
-    });
+    // 6️⃣ Call WaveSpeed / image worker
+    console.log('🖼️ Triggering image generation via WaveSpeed worker...');
+    try {
+      const waveRes = await fetch(IMAGE_WORKER_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timetableId, promptsByDay }),
+      });
+      console.log(`📡 WaveSpeed worker called. Status: ${waveRes.status}`);
+      const waveText = await waveRes.text();
+      console.log('📥 WaveSpeed response body:', waveText);
+    } catch (err) {
+      console.error('❌ Failed to call WaveSpeed worker:', err.message);
+    }
 
-    console.log('🖼️ Image generation triggered for:', timetableId);
+    console.log('🚀 processInBackground complete');
   } catch (err) {
     console.error('❌ Meal planner failed:', err.message);
   }
@@ -355,20 +313,13 @@ async function processInBackground(payload) {
 
 // ---------------- ROUTE ----------------
 app.post('/generate-timetable', (req, res) => {
-  if (!req.body?.userId) {
-    return res.status(400).json({ error: 'userId required' });
-  }
+  if (!req.body?.userId) return res.status(400).json({ error: 'userId required' });
 
-  // Respond immediately so Supabase doesn't time out
   res.json({ success: true, status: 'processing' });
-
-  // Process in background
   processInBackground(req.body);
 });
 
 app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 // ---------------- START ----------------
-app.listen(PORT, '0.0.0.0', () =>
-  console.log(`🍽️ Meal planner worker running on port ${PORT}`)
-);
+app.listen(PORT, '0.0.0.0', () => console.log(`🍽️ Meal planner worker running on port ${PORT}`));
