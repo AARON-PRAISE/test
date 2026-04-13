@@ -20,6 +20,13 @@ if (!FIREBASE_CLIENT_EMAIL) throw new Error('FIREBASE_CLIENT_EMAIL missing');
 if (!FIREBASE_PRIVATE_KEY) throw new Error('FIREBASE_PRIVATE_KEY missing');
 if (!IMAGE_WORKER_URL) throw new Error('IMAGE_WORKER_URL missing');
 
+// ---------------- FIRESTORE USER REF ----------------
+function buildUserRef(userId) {
+  return {
+    referenceValue: `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/users/${userId}`
+  };
+}
+
 // ---------------- JWT / FIREBASE AUTH ----------------
 function str2ab(pem) {
   const clean = pem
@@ -27,6 +34,7 @@ function str2ab(pem) {
     .replace(/-----END PRIVATE KEY-----/, '')
     .replace(/\\n/g, '')
     .replace(/[\r\n\s]/g, '');
+
   const binary = atob(clean);
   const buffer = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -97,7 +105,7 @@ async function getAccessToken() {
 function toFirestoreValue(val) {
   if (typeof val === 'number') return { doubleValue: val };
   if (typeof val === 'boolean') return { booleanValue: val };
-  if (Array.isArray(val)) return { arrayValue: { values: val.map((v) => toFirestoreValue(v)) } };
+  if (Array.isArray(val)) return { arrayValue: { values: val.map(toFirestoreValue) } };
   if (val !== null && typeof val === 'object')
     return { mapValue: { fields: Object.fromEntries(Object.entries(val).map(([k, v]) => [k, toFirestoreValue(v)])) } };
   return { stringValue: String(val ?? '') };
@@ -111,83 +119,68 @@ function toFirestoreFields(obj) {
 
 async function firestoreCreate(collection, data, token) {
   const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${collection}`;
+
   const res = await fetch(url, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
     body: JSON.stringify({ fields: toFirestoreFields(data) }),
   });
+
   const result = await res.json();
-  if (!res.ok) throw new Error(`Firestore create failed: ${JSON.stringify(result)}`);
-  const docName = result.name;
-  return docName.split('/').pop();
+  if (!res.ok) throw new Error(JSON.stringify(result));
+
+  return result.name.split('/').pop();
 }
 
-async function firestoreUpdate(docPath, data, token) {
-  const fieldPaths = Object.keys(data).join('&updateMask.fieldPaths=');
-  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${docPath}?updateMask.fieldPaths=${fieldPaths}`;
-  const res = await fetch(url, {
-    method: 'PATCH',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fields: toFirestoreFields(data) }),
+// ---------------- SHOPPING LIST ----------------
+async function createShoppingItem(item, userId, token) {
+  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/ShoppingList`;
+
+  const body = {
+    fields: {
+      Name: { stringValue: item.name || '' },
+      Cost: { integerValue: String(item.cost || 0) },
+      Description: { stringValue: item.description || '' },
+      userID: buildUserRef(userId),
+      TotalCost: { integerValue: String(item.cost || 0) }
+    }
+  };
+
+  await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`Firestore update failed: ${await res.text()}`);
 }
 
-// ---------------- HELPERS ----------------
-function exactly12(arr) {
-  const out = Array.isArray(arr) ? arr.map(String) : [];
-  while (out.length < 12) out.push('');
-  return out.slice(0, 12);
-}
-
-function ensureArray(v) {
-  if (Array.isArray(v)) return v.map(String);
-  if (typeof v === 'string') return v.split(',').map((s) => s.trim());
-  return [];
-}
-
-// ---------------- OPENAI PROMPT ----------------
+// ---------------- OPENAI ----------------
 function buildMessages(input) {
   return [
     {
       role: 'system',
       content: `
-You are a professional Nigerian meal planner.
+You are a Nigerian meal planner.
 
-Generate a COMPLETE 7-day meal plan.
+Generate:
+1. 7-day meal plan (breakfast, lunch, dinner)
+2. missing_ingredients based on available ingredients
 
-For EACH day (Sunday–Saturday) and EACH meal (breakfast, lunch, dinner), generate:
-- name
-- description
-- ingredients_used
-- additional_ingredients_to_buy
-- instructions (9–12 steps)
-- equipment
-- estimated_cost (integer)
-- image_prompts:
-  - food
-  - step_1
-  - step_5
-  - step_9 (only if step 9 exists)
-
-Rules:
-- Nigerian meals only
-- Photorealistic food
-- Append "low quality" to ALL image prompts
-- Return ONLY valid JSON
-- DO NOT omit any day
-
-Required structure:
+Return JSON ONLY:
 {
-  "weekly_meal_plan": {
-    "sunday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "monday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "tuesday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "wednesday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "thursday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "friday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "saturday": { "breakfast": {}, "lunch": {}, "dinner": {} }
-  }
+  "weekly_meal_plan": {...},
+  "missing_ingredients": [
+    {
+      "name": "",
+      "cost": 0,
+      "description": ""
+    }
+  ]
 }
       `.trim(),
     },
@@ -195,119 +188,77 @@ Required structure:
   ];
 }
 
-// ---------------- VALIDATION ----------------
-function validateWeek(week) {
-  const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
-  for (const day of days) {
-    if (!week[day]) throw new Error(`Missing day: ${day}`);
-    for (const meal of ['breakfast','lunch','dinner']) {
-      if (!week[day][meal]) throw new Error(`Missing ${meal} on ${day}`);
-    }
-  }
-}
-
-// ---------------- DAY BUILDER ----------------
-function buildDay(day, imagePromptMap, dayName) {
-  const out = {};
-  for (const type of ['breakfast','lunch','dinner']) {
-    const m = day[type];
-    const P = type.charAt(0).toUpperCase() + type.slice(1);
-    out[`${P}Name`] = m.name ?? '';
-    out[`${P}Description`] = m.description ?? '';
-    out[`${P}Ingredients`] = ensureArray(m.ingredients_used);
-    out[`MissingIngredients${P}`] = ensureArray(m.additional_ingredients_to_buy);
-    out[`${P}Instructions`] = exactly12(m.instructions);
-    out[`${P}Equipment`] = ensureArray(m.equipment);
-    out[`${type}cost`] = Number(m.estimated_cost) || 0;
-    out[`${P}Image`] = '';
-    out[`${P}InstructionImages`] = [];
-
-    // Extract image prompts for worker
-    if (m.image_prompts) {
-      if (!imagePromptMap[dayName]) imagePromptMap[dayName] = {};
-      imagePromptMap[dayName][P] = [
-        { key: `${P}Meal`, prompt: m.image_prompts.food },
-        { key: `${P}Step1`, prompt: m.image_prompts.step_1 },
-        { key: `${P}Step5`, prompt: m.image_prompts.step_5 },
-        ...(m.image_prompts.step_9 ? [{ key: `${P}Step9`, prompt: m.image_prompts.step_9 }] : []),
-      ];
-    }
-  }
-  return out;
-}
-
-// ---------------- BACKGROUND JOB ----------------
+// ---------------- MAIN LOGIC ----------------
 async function processInBackground(payload) {
   try {
     const token = await getAccessToken();
 
-    // 1️⃣ Create Timetable doc
+    // 1️⃣ CREATE TIMETABLE (FIXED USER FIELD)
     const timetableId = await firestoreCreate(
       'Timetable',
-      { userId: payload.userId, status: 'creating', created_at: new Date().toISOString() },
+      {
+        user: buildUserRef(payload.userId),
+        status: 'creating',
+        created_at: new Date().toISOString()
+      },
       token
     );
-    console.log('📄 Timetable doc created with ID:', timetableId);
 
-    // 2️⃣ Call OpenAI
-    console.log('🤖 Calling OpenAI for weekly meal plan...');
+    console.log('📄 Timetable created:', timetableId);
+
+    // 2️⃣ OPENAI CALL
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-4o-mini', messages: buildMessages(payload), max_tokens: 7000 }),
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: buildMessages(payload),
+        max_tokens: 7000,
+      }),
     });
 
     const raw = await res.text();
-    if (!res.ok) throw new Error(`OpenAI error: ${raw}`);
-    console.log('✅ OpenAI returned a response');
+    const parsed = JSON.parse(JSON.parse(raw).choices[0].message.content);
 
-    const openAIResult = JSON.parse(raw);
-    const content = openAIResult.choices[0].message.content;
-    const cleaned = content.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(cleaned);
     const week = parsed.weekly_meal_plan;
+    const missing = parsed.missing_ingredients || [];
 
-    // 3️⃣ Validate week
-    validateWeek(week);
-    console.log('📅 Weekly meal plan validated');
+    console.log('✅ OpenAI processed');
 
-    // 4️⃣ Build timetable data + extract image prompts
-    const promptsByDay = {};
-    const timetableData = {
-      Sunday: buildDay(week.sunday, promptsByDay, 'Sunday'),
-      Monday: buildDay(week.monday, promptsByDay, 'Monday'),
-      Tuesday: buildDay(week.tuesday, promptsByDay, 'Tuesday'),
-      Wednesday: buildDay(week.wednesday, promptsByDay, 'Wednesday'),
-      Thursday: buildDay(week.thursday, promptsByDay, 'Thursday'),
-      Friday: buildDay(week.friday, promptsByDay, 'Friday'),
-      Saturday: buildDay(week.saturday, promptsByDay, 'Saturday'),
+    // 3️⃣ SAVE TIMETABLE
+    await firestoreCreate(`Timetable/${timetableId}`, {
       status: 'completed',
-      updated_at: new Date().toISOString(),
-    };
-    console.log('🛠️ Timetable data built. Prompts extracted for image generation');
+      updated_at: new Date().toISOString()
+    }, token);
 
-    // 5️⃣ Save meal plan to Firestore
-    await firestoreUpdate(`Timetable/${timetableId}`, timetableData, token);
-    console.log('✅ Meal plan saved to Firestore:', timetableId);
+    console.log('✅ Timetable saved');
 
-    // 6️⃣ Call WaveSpeed / image worker
-    console.log('🖼️ Triggering image generation via WaveSpeed worker...');
-    try {
-      const waveRes = await fetch(IMAGE_WORKER_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timetableId, promptsByDay }),
-      });
-      console.log(`📡 WaveSpeed worker called. Status: ${waveRes.status}`);
-      const waveText = await waveRes.text();
-      console.log('📥 WaveSpeed response body:', waveText);
-    } catch (err) {
-      console.error('❌ Failed to call WaveSpeed worker:', err.message);
+    // 4️⃣ CREATE SHOPPING LIST ITEMS
+    console.log('🛒 Creating shopping list...');
+
+    for (const item of missing) {
+      await createShoppingItem(item, payload.userId, token);
     }
 
-    console.log('🚀 processInBackground complete');
+    console.log('✅ Shopping list created');
+
+    // 5️⃣ TRIGGER IMAGE WORKER
+    await fetch(IMAGE_WORKER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        timetableId,
+        promptsByDay: parsed.promptsByDay || {}
+      }),
+    });
+
+    console.log('🖼️ Image worker triggered');
+
   } catch (err) {
-    console.error('❌ Meal planner failed:', err.message);
+    console.error('❌ Error:', err.message);
   }
 }
 
@@ -315,11 +266,9 @@ async function processInBackground(payload) {
 app.post('/generate-timetable', (req, res) => {
   if (!req.body?.userId) return res.status(400).json({ error: 'userId required' });
 
-  res.json({ success: true, status: 'processing' });
+  res.json({ status: 'processing' });
   processInBackground(req.body);
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
-
 // ---------------- START ----------------
-app.listen(PORT, '0.0.0.0', () => console.log(`🍽️ Meal planner worker running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
