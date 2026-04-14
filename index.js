@@ -341,8 +341,20 @@ async function processInBackground(payload) {
 
     const openAIResult = JSON.parse(raw);
     const content = openAIResult.choices[0].message.content;
-    const cleaned = content.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(cleaned);
+ const cleaned = content
+  .replace(/```json|```/g, '')
+  .replace(/[\u0000-\u001F\u007F]/g, (char) => {
+    // Preserve legitimate escape sequences
+    switch (char) {
+      case '\n': return '\\n';
+      case '\r': return '\\r';
+      case '\t': return '\\t';
+      default: return '';
+    }
+  })
+  .trim();
+
+const parsed = JSON.parse(cleaned);
     const week = parsed.weekly_meal_plan;
 
     // 3️⃣ Validate week
