@@ -1,3 +1,420 @@
-const express = require('express'); const fetch = require('node-fetch'); require('dotenv').config(); const app = express(); app.use(express.json()); const PORT = process.env.PORT || 3000; // ---------------- ENV ---------------- const OPENAI_API_KEY = process.env.OPENAI_API_KEY; const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID; const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL; const FIREBASE_PRIVATE_KEY = process.env.FIREBASE_PRIVATE_KEY; const IMAGE_WORKER_URL = process.env.IMAGE_WORKER_URL; if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY missing'); if (!FIREBASE_PROJECT_ID) throw new Error('FIREBASE_PROJECT_ID missing'); if (!FIREBASE_CLIENT_EMAIL) throw new Error('FIREBASE_CLIENT_EMAIL missing'); if (!FIREBASE_PRIVATE_KEY) throw new Error('FIREBASE_PRIVATE_KEY missing'); if (!IMAGE_WORKER_URL) throw new Error('IMAGE_WORKER_URL missing'); // ---------------- JWT / FIREBASE AUTH ---------------- function str2ab(pem) { const clean = pem .replace(/-----BEGIN PRIVATE KEY-----/, '') .replace(/-----END PRIVATE KEY-----/, '') .replace(/\\n/g, '') .replace(/[\r\n\s]/g, ''); const binary = atob(clean); const buffer = new Uint8Array(binary.length); for (let i = 0; i < binary.length; i++) { buffer[i] = binary.charCodeAt(i); } return buffer.buffer; } async function getAccessToken() { const iat = Math.floor(Date.now() / 1000); const exp = iat + 3600; function base64url(obj) { return btoa(JSON.stringify(obj)) .replace(/=/g, '') .replace(/\+/g, '-') .replace(/\//g, '_'); } const headerB64 = base64url({ alg: 'RS256', typ: 'JWT' }); const payloadB64 = base64url({ iss: FIREBASE_CLIENT_EMAIL, sub: FIREBASE_CLIENT_EMAIL, aud: 'https://oauth2.googleapis.com/token', iat, exp, scope: 'https://www.googleapis.com/auth/datastore', }); const signingInput = ${headerB64}.${payloadB64}; const key = await crypto.subtle.importKey( 'pkcs8', str2ab(FIREBASE_PRIVATE_KEY), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign'] ); const signature = await crypto.subtle.sign( 'RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(signingInput) ); const sigB64 = btoa(String.fromCharCode(...new Uint8Array(signature))) .replace(/=/g, '') .replace(/\+/g, '-') .replace(/\//g, '_'); const jwt = ${signingInput}.${sigB64}; const res = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: jwt, }), }); const data = await res.json(); if (!data.access_token) throw new Error('Failed to get Firebase access token'); return data.access_token; } // ---------------- FIRESTORE HELPERS ---------------- function toFirestoreValue(val) { if (typeof val === 'number') return { doubleValue: val }; if (typeof val === 'boolean') return { booleanValue: val }; if (Array.isArray(val)) return { arrayValue: { values: val.map((v) => toFirestoreValue(v)) } }; if (val !== null && typeof val === 'object') return { mapValue: { fields: Object.fromEntries(Object.entries(val).map(([k, v]) => [k, toFirestoreValue(v)])) } }; return { stringValue: String(val ?? '') }; } function toFirestoreFields(obj) { const fields = {}; for (const key in obj) fields[key] = toFirestoreValue(obj[key]); return fields; } async function firestoreCreate(collection, data, token) { const url = https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${collection}; const res = await fetch(url, { method: 'POST', headers: { Authorization: Bearer ${token}, 'Content-Type': 'application/json' }, body: JSON.stringify({ fields: toFirestoreFields(data) }), }); const result = await res.json(); if (!res.ok) throw new Error(Firestore create failed: ${JSON.stringify(result)}); const docName = result.name; return docName.split('/').pop(); } async function firestoreUpdate(docPath, data, token) { const fieldPaths = Object.keys(data).join('&updateMask.fieldPaths='); const url = https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${docPath}?updateMask.fieldPaths=${fieldPaths}; const res = await fetch(url, { method: 'PATCH', headers: { Authorization: Bearer ${token}, 'Content-Type': 'application/json' }, body: JSON.stringify({ fields: toFirestoreFields(data) }), }); if (!res.ok) throw new Error(Firestore update failed: ${await res.text()}); } // ---------------- HELPERS ---------------- function exactly12(arr) { const out = Array.isArray(arr) ? arr.map(String) : []; while (out.length < 12) out.push(''); return out.slice(0, 12); } function ensureArray(v) { if (Array.isArray(v)) return v.map(String); if (typeof v === 'string') return v.split(',').map((s) => s.trim()); return []; } // ---------------- OPENAI PROMPT ---------------- function buildMessages(input) { return [ { role: 'system', content: You are a professional Nigerian meal planner. Generate a COMPLETE 7-day meal plan. For EACH day (Sunday–Saturday) and EACH meal (breakfast, lunch, dinner), generate: - name - description - ingredients_used - additional_ingredients_to_buy - instructions (9–12 steps) - equipment - estimated_cost (integer) - image_prompts: - food - step_1 - step_5 - step_9 (only if step 9 exists) Rules: - Nigerian meals only - Photorealistic food - Append "low quality" to ALL image prompts - Return ONLY valid JSON - DO NOT omit any day Required structure: { "weekly_meal_plan": { "sunday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "monday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "tuesday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "wednesday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "thursday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "friday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "saturday": { "breakfast": {}, "lunch": {}, "dinner": {} } } } .trim(), }, { role: 'user', content: JSON.stringify(input) }, ]; } // ---------------- VALIDATION ---------------- function validateWeek(week) { const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday']; for (const day of days) { if (!week[day]) throw new Error(Missing day: ${day}); for (const meal of ['breakfast','lunch','dinner']) { if (!week[day][meal]) throw new Error(Missing ${meal} on ${day}); } } } // ---------------- DAY BUILDER ---------------- function buildDay(day, imagePromptMap, dayName) { const out = {}; for (const type of ['breakfast','lunch','dinner']) { const m = day[type]; const P = type.charAt(0).toUpperCase() + type.slice(1); out[${P}Name] = m.name ?? ''; out[${P}Description] = m.description ?? ''; out[${P}Ingredients] = ensureArray(m.ingredients_used); out[MissingIngredients${P}] = ensureArray(m.additional_ingredients_to_buy); out[${P}Instructions] = exactly12(m.instructions); out[${P}Equipment] = ensureArray(m.equipment); out[${type}cost] = Number(m.estimated_cost) || 0; out[${P}Image] = ''; out[${P}InstructionImages] = []; // Extract image prompts for worker if (m.image_prompts) { if (!imagePromptMap[dayName]) imagePromptMap[dayName] = {}; imagePromptMap[dayName][P] = [ { key: ${P}Meal, prompt: m.image_prompts.food }, { key: ${P}Step1, prompt: m.image_prompts.step_1 }, { key: ${P}Step5, prompt: m.image_prompts.step_5 }, ...(m.image_prompts.step_9 ? [{ key: ${P}Step9, prompt: m.image_prompts.step_9 }] : []), ]; } } return out; } // ---------------- BACKGROUND JOB ---------------- async function processInBackground(payload) { try { const token = await getAccessToken(); // 1️⃣ Create Timetable doc const timetableId = await firestoreCreate( 'Timetable', { userId: payload.userId, status: 'creating', created_at: new Date().toISOString() }, token ); console.log('📄 Timetable doc created with ID:', timetableId); // 2️⃣ Call OpenAI console.log('🤖 Calling OpenAI for weekly meal plan...'); const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { Authorization: Bearer ${OPENAI_API_KEY}, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'gpt-4o-mini', messages: buildMessages(payload), max_tokens: 7000 }), }); const raw = await res.text(); if (!res.ok) throw new Error(OpenAI error: ${raw}); console.log('✅ OpenAI returned a response'); const openAIResult = JSON.parse(raw); const content = openAIResult.choices[0].message.content; const cleaned = content.replace(/
-json|
-/g, '').trim(); const parsed = JSON.parse(cleaned); const week = parsed.weekly_meal_plan; // 3️⃣ Validate week validateWeek(week); console.log('📅 Weekly meal plan validated'); // 4️⃣ Build timetable data + extract image prompts const promptsByDay = {}; const timetableData = { Sunday: buildDay(week.sunday, promptsByDay, 'Sunday'), Monday: buildDay(week.monday, promptsByDay, 'Monday'), Tuesday: buildDay(week.tuesday, promptsByDay, 'Tuesday'), Wednesday: buildDay(week.wednesday, promptsByDay, 'Wednesday'), Thursday: buildDay(week.thursday, promptsByDay, 'Thursday'), Friday: buildDay(week.friday, promptsByDay, 'Friday'), Saturday: buildDay(week.saturday, promptsByDay, 'Saturday'), status: 'completed', updated_at: new Date().toISOString(), }; console.log('🛠️ Timetable data built. Prompts extracted for image generation'); // 5️⃣ Save meal plan to Firestore await firestoreUpdate(Timetable/${timetableId}, timetableData, token); console.log('✅ Meal plan saved to Firestore:', timetableId); // 6️⃣ Call WaveSpeed / image worker console.log('🖼️ Triggering image generation via WaveSpeed worker...'); try { const waveRes = await fetch(IMAGE_WORKER_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ timetableId, promptsByDay }), }); console.log(📡 WaveSpeed worker called. Status: ${waveRes.status}); const waveText = await waveRes.text(); console.log('📥 WaveSpeed response body:', waveText); } catch (err) { console.error('❌ Failed to call WaveSpeed worker:', err.message); } console.log('🚀 processInBackground complete'); } catch (err) { console.error('❌ Meal planner failed:', err.message); } } // ---------------- ROUTE ---------------- app.post('/generate-timetable', (req, res) => { if (!req.body?.userId) return res.status(400).json({ error: 'userId required' }); res.json({ success: true, status: 'processing' }); processInBackground(req.body); }); app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() })); // ---------------- START ---------------- app.listen(PORT, '0.0.0.0', () => console.log(🍽️ Meal planner worker running on port ${PORT}));
+const express = require('express');
+const fetch = require('node-fetch');
+require('dotenv').config();
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+// ---------------- ENV ----------------
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
+const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL;
+const FIREBASE_PRIVATE_KEY = process.env.FIREBASE_PRIVATE_KEY;
+const IMAGE_WORKER_URL = process.env.IMAGE_WORKER_URL;
+
+if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY missing');
+if (!FIREBASE_PROJECT_ID) throw new Error('FIREBASE_PROJECT_ID missing');
+if (!FIREBASE_CLIENT_EMAIL) throw new Error('FIREBASE_CLIENT_EMAIL missing');
+if (!FIREBASE_PRIVATE_KEY) throw new Error('FIREBASE_PRIVATE_KEY missing');
+if (!IMAGE_WORKER_URL) throw new Error('IMAGE_WORKER_URL missing');
+
+// ---------------- JWT / FIREBASE AUTH ----------------
+function str2ab(pem) {
+  const clean = pem
+    .replace(/-----BEGIN PRIVATE KEY-----/, '')
+    .replace(/-----END PRIVATE KEY-----/, '')
+    .replace(/\\n/g, '')
+    .replace(/[\r\n\s]/g, '');
+  const binary = atob(clean);
+  const buffer = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    buffer[i] = binary.charCodeAt(i);
+  }
+  return buffer.buffer;
+}
+
+async function getAccessToken() {
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = iat + 3600;
+
+  function base64url(obj) {
+    return btoa(JSON.stringify(obj))
+      .replace(/=/g, '')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_');
+  }
+
+  const headerB64 = base64url({ alg: 'RS256', typ: 'JWT' });
+  const payloadB64 = base64url({
+    iss: FIREBASE_CLIENT_EMAIL,
+    sub: FIREBASE_CLIENT_EMAIL,
+    aud: 'https://oauth2.googleapis.com/token',
+    iat,
+    exp,
+    scope: 'https://www.googleapis.com/auth/datastore',
+  });
+
+  const signingInput = `${headerB64}.${payloadB64}`;
+
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    str2ab(FIREBASE_PRIVATE_KEY),
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const signature = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    new TextEncoder().encode(signingInput)
+  );
+
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(signature)))
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+
+  const jwt = `${signingInput}.${sigB64}`;
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt,
+    }),
+  });
+
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Failed to get Firebase access token');
+  return data.access_token;
+}
+
+// ---------------- FIRESTORE HELPERS ----------------
+function toFirestoreValue(val) {
+  // Handle document references
+  if (val && typeof val === 'object' && val.__type === 'reference') {
+    return {
+      referenceValue: `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${val.path}`,
+    };
+  }
+  if (typeof val === 'number') return { doubleValue: val };
+  if (typeof val === 'boolean') return { booleanValue: val };
+  if (Array.isArray(val))
+    return { arrayValue: { values: val.map((v) => toFirestoreValue(v)) } };
+  if (val !== null && typeof val === 'object')
+    return {
+      mapValue: {
+        fields: Object.fromEntries(
+          Object.entries(val).map(([k, v]) => [k, toFirestoreValue(v)])
+        ),
+      },
+    };
+  return { stringValue: String(val ?? '') };
+}
+
+function toFirestoreFields(obj) {
+  const fields = {};
+  for (const key in obj) fields[key] = toFirestoreValue(obj[key]);
+  return fields;
+}
+
+async function firestoreCreate(collection, data, token) {
+  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${collection}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ fields: toFirestoreFields(data) }),
+  });
+  const result = await res.json();
+  if (!res.ok) throw new Error(`Firestore create failed: ${JSON.stringify(result)}`);
+  const docName = result.name;
+  return docName.split('/').pop();
+}
+
+async function firestoreUpdate(docPath, data, token) {
+  const fieldPaths = Object.keys(data).join('&updateMask.fieldPaths=');
+  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${docPath}?updateMask.fieldPaths=${fieldPaths}`;
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ fields: toFirestoreFields(data) }),
+  });
+  if (!res.ok) throw new Error(`Firestore update failed: ${await res.text()}`);
+}
+
+// ---------------- HELPERS ----------------
+function exactly12(arr) {
+  const out = Array.isArray(arr) ? arr.map(String) : [];
+  while (out.length < 12) out.push('');
+  return out.slice(0, 12);
+}
+
+function ensureArray(v) {
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === 'string') return v.split(',').map((s) => s.trim());
+  return [];
+}
+
+// ---------------- OPENAI PROMPT ----------------
+function buildMessages(input) {
+  const availableIngredients = input.availableIngredients || [];
+
+  return [
+    {
+      role: 'system',
+      content: `
+You are a professional Nigerian meal planner. Generate a COMPLETE 7-day meal plan.
+
+The user has these ingredients already available: ${JSON.stringify(availableIngredients)}
+
+For EACH day (Sunday–Saturday) and EACH meal (breakfast, lunch, dinner), generate:
+- name
+- description
+- ingredients_used
+- additional_ingredients_to_buy: simple string array of ingredient names NOT in the available list above
+- shopping_list_items: array of objects for ingredients NOT in the available list above, each with:
+    { "name": string, "cost": integer (in Naira), "description": string }
+- instructions (9–12 steps)
+- equipment
+- estimated_cost (integer)
+- image_prompts:
+    - food
+    - step_1
+    - step_5
+    - step_9 (only if step 9 exists)
+
+Rules:
+- Nigerian meals only
+- Photorealistic food
+- Append "low quality" to ALL image prompts
+- Return ONLY valid JSON
+- DO NOT omit any day
+- For shopping_list_items, only include ingredients the user does NOT have based on the available list
+
+Required structure:
+{
+  "weekly_meal_plan": {
+    "sunday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "monday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "tuesday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "wednesday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "thursday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "friday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "saturday": { "breakfast": {}, "lunch": {}, "dinner": {} }
+  }
+}
+      `.trim(),
+    },
+    { role: 'user', content: JSON.stringify(input) },
+  ];
+}
+
+// ---------------- VALIDATION ----------------
+function validateWeek(week) {
+  const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  for (const day of days) {
+    if (!week[day]) throw new Error(`Missing day: ${day}`);
+    for (const meal of ['breakfast', 'lunch', 'dinner']) {
+      if (!week[day][meal]) throw new Error(`Missing ${meal} on ${day}`);
+    }
+  }
+}
+
+// ---------------- DAY BUILDER ----------------
+function buildDay(day, imagePromptMap, dayName) {
+  const out = {};
+  for (const type of ['breakfast', 'lunch', 'dinner']) {
+    const m = day[type];
+    const P = type.charAt(0).toUpperCase() + type.slice(1);
+
+    out[`${P}Name`] = m.name ?? '';
+    out[`${P}Description`] = m.description ?? '';
+    out[`${P}Ingredients`] = ensureArray(m.ingredients_used);
+    out[`MissingIngredients${P}`] = ensureArray(m.additional_ingredients_to_buy); // ✅ stays as string array
+    out[`${P}Instructions`] = exactly12(m.instructions);
+    out[`${P}Equipment`] = ensureArray(m.equipment);
+    out[`${type}cost`] = Number(m.estimated_cost) || 0;
+    out[`${P}Image`] = '';
+    out[`${P}InstructionImages`] = [];
+
+    // Extract image prompts for worker
+    if (m.image_prompts) {
+      if (!imagePromptMap[dayName]) imagePromptMap[dayName] = {};
+      imagePromptMap[dayName][P] = [
+        { key: `${P}Meal`, prompt: m.image_prompts.food },
+        { key: `${P}Step1`, prompt: m.image_prompts.step_1 },
+        { key: `${P}Step5`, prompt: m.image_prompts.step_5 },
+        ...(m.image_prompts.step_9
+          ? [{ key: `${P}Step9`, prompt: m.image_prompts.step_9 }]
+          : []),
+      ];
+    }
+  }
+  return out;
+}
+
+// ---------------- SHOPPING LIST BUILDER ----------------
+/**
+ * Loops through all 7 days and 3 meals, collects all shopping_list_items,
+ * deduplicates by name (case-insensitive), sums up TotalCost,
+ * and returns { totalCost, items } ready for Firestore.
+ */
+function buildShoppingList(week) {
+  const dayKeys = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const mealTypes = ['breakfast', 'lunch', 'dinner'];
+
+  const seen = new Map(); // name (lowercase) -> { Name, Cost, Description }
+
+  for (const day of dayKeys) {
+    for (const meal of mealTypes) {
+      const m = week[day][meal];
+      const items = Array.isArray(m.shopping_list_items) ? m.shopping_list_items : [];
+
+      for (const item of items) {
+        const key = String(item.name || '').toLowerCase().trim();
+        if (!key) continue;
+
+        // If duplicate, keep the one with higher cost (or just skip — your choice)
+        if (!seen.has(key)) {
+          seen.set(key, {
+            Name: String(item.name || ''),
+            Cost: Number(item.cost) || 0,
+            Description: String(item.description || ''),
+          });
+        }
+      }
+    }
+  }
+
+  const items = Array.from(seen.values());
+  const totalCost = items.reduce((sum, i) => sum + i.Cost, 0);
+
+  return { totalCost, items };
+}
+
+// ---------------- BACKGROUND JOB ----------------
+async function processInBackground(payload) {
+  try {
+    const token = await getAccessToken();
+
+    // 1️⃣ Create Timetable doc with user reference
+    const timetableId = await firestoreCreate(
+      'Timetable',
+      {
+        userId: payload.userId,
+        user: { __type: 'reference', path: `users/${payload.userId}` }, // ✅ Doc Reference field
+        status: 'creating',
+        created_at: new Date().toISOString(),
+      },
+      token
+    );
+    console.log('📄 Timetable doc created with ID:', timetableId);
+
+    // 2️⃣ Call OpenAI
+    console.log('🤖 Calling OpenAI for weekly meal plan...');
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: buildMessages(payload),
+        max_tokens: 7000,
+      }),
+    });
+
+    const raw = await res.text();
+    if (!res.ok) throw new Error(`OpenAI error: ${raw}`);
+    console.log('✅ OpenAI returned a response');
+
+    const openAIResult = JSON.parse(raw);
+    const content = openAIResult.choices[0].message.content;
+    const cleaned = content.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+    const week = parsed.weekly_meal_plan;
+
+    // 3️⃣ Validate week
+    validateWeek(week);
+    console.log('📅 Weekly meal plan validated');
+
+    // 4️⃣ Build timetable data + extract image prompts
+    const promptsByDay = {};
+    const timetableData = {
+      Sunday: buildDay(week.sunday, promptsByDay, 'Sunday'),
+      Monday: buildDay(week.monday, promptsByDay, 'Monday'),
+      Tuesday: buildDay(week.tuesday, promptsByDay, 'Tuesday'),
+      Wednesday: buildDay(week.wednesday, promptsByDay, 'Wednesday'),
+      Thursday: buildDay(week.thursday, promptsByDay, 'Thursday'),
+      Friday: buildDay(week.friday, promptsByDay, 'Friday'),
+      Saturday: buildDay(week.saturday, promptsByDay, 'Saturday'),
+      status: 'completed',
+      updated_at: new Date().toISOString(),
+    };
+    console.log('🛠️ Timetable data built. Prompts extracted for image generation');
+
+    // 5️⃣ Save meal plan to Firestore
+    await firestoreUpdate(`Timetable/${timetableId}`, timetableData, token);
+    console.log('✅ Meal plan saved to Firestore:', timetableId);
+
+    // 6️⃣ Build and save ShoppingList document
+    console.log('🛒 Building ShoppingList...');
+    const { totalCost, items } = buildShoppingList(week);
+
+    const shoppingListData = {
+      TotalCost: totalCost,                                                         // Integer
+      userID: { __type: 'reference', path: `users/${payload.userId}` },             // Doc Reference (users)
+      Detail: items,                                                                 // List<Data(ShoppingList)> — each has Name, Cost, Description
+    };
+
+    const shoppingListId = await firestoreCreate('ShoppingList', shoppingListData, token);
+    console.log('✅ ShoppingList saved to Firestore:', shoppingListId);
+    console.log(`   → ${items.length} unique items, Total Cost: ₦${totalCost}`);
+
+    // 7️⃣ Call WaveSpeed / image worker
+    console.log('🖼️ Triggering image generation via WaveSpeed worker...');
+    try {
+      const waveRes = await fetch(IMAGE_WORKER_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timetableId, promptsByDay }),
+      });
+      console.log(`📡 WaveSpeed worker called. Status: ${waveRes.status}`);
+      const waveText = await waveRes.text();
+      console.log('📥 WaveSpeed response body:', waveText);
+    } catch (err) {
+      console.error('❌ Failed to call WaveSpeed worker:', err.message);
+    }
+
+    console.log('🚀 processInBackground complete');
+  } catch (err) {
+    console.error('❌ Meal planner failed:', err.message);
+  }
+}
+
+// ---------------- ROUTE ----------------
+app.post('/generate-timetable', (req, res) => {
+  if (!req.body?.userId) return res.status(400).json({ error: 'userId required' });
+
+  // availableIngredients is optional — defaults to [] in buildMessages
+  res.json({ success: true, status: 'processing' });
+  processInBackground(req.body);
+});
+
+app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+// ---------------- START ----------------
+app.listen(PORT, '0.0.0.0', () =>
+  console.log(`🍽️ Meal planner worker running on port ${PORT}`)
+);
