@@ -331,7 +331,7 @@ async function processInBackground(payload) {
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         messages: buildMessages(payload),
-        max_tokens: 7000,
+        max_tokens: 16000,
       }),
     });
 
