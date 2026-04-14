@@ -349,6 +349,16 @@ async function processInBackground(payload) {
     validateWeek(week);
     console.log('📅 Weekly meal plan validated');
 
+
+    // 👇 ADD DEBUG HERE
+const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+for (const day of days) {
+  for (const meal of ['breakfast','lunch','dinner']) {
+    const items = week[day][meal].shopping_list_items;
+    console.log(`🔍 ${day} ${meal} shopping_list_items:`, JSON.stringify(items));
+  }
+}
+
     // 4️⃣ Build timetable data + extract image prompts
     const promptsByDay = {};
     const timetableData = {
