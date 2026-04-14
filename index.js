@@ -20,14 +20,12 @@ if (!FIREBASE_CLIENT_EMAIL) throw new Error('FIREBASE_CLIENT_EMAIL missing');
 if (!FIREBASE_PRIVATE_KEY) throw new Error('FIREBASE_PRIVATE_KEY missing');
 if (!IMAGE_WORKER_URL) throw new Error('IMAGE_WORKER_URL missing');
 
-// ---------------- FIRESTORE USER REF ----------------
-function buildUserRef(userId) {
-  return {
-    referenceValue: `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/users/${userId}`
-  };
+// ---------------- FIRESTORE REFERENCE ----------------
+function userRef(userId) {
+  return `/users/${userId}`;
 }
 
-// ---------------- JWT / FIREBASE AUTH ----------------
+// ---------------- JWT ----------------
 function str2ab(pem) {
   const clean = pem
     .replace(/-----BEGIN PRIVATE KEY-----/, '')
@@ -47,15 +45,14 @@ async function getAccessToken() {
   const iat = Math.floor(Date.now() / 1000);
   const exp = iat + 3600;
 
-  function base64url(obj) {
-    return btoa(JSON.stringify(obj))
+  const base64url = (obj) =>
+    btoa(JSON.stringify(obj))
       .replace(/=/g, '')
       .replace(/\+/g, '-')
       .replace(/\//g, '_');
-  }
 
-  const headerB64 = base64url({ alg: 'RS256', typ: 'JWT' });
-  const payloadB64 = base64url({
+  const header = base64url({ alg: 'RS256', typ: 'JWT' });
+  const payload = base64url({
     iss: FIREBASE_CLIENT_EMAIL,
     sub: FIREBASE_CLIENT_EMAIL,
     aud: 'https://oauth2.googleapis.com/token',
@@ -64,7 +61,7 @@ async function getAccessToken() {
     scope: 'https://www.googleapis.com/auth/datastore',
   });
 
-  const signingInput = `${headerB64}.${payloadB64}`;
+  const signingInput = `${header}.${payload}`;
 
   const key = await crypto.subtle.importKey(
     'pkcs8',
@@ -97,27 +94,26 @@ async function getAccessToken() {
   });
 
   const data = await res.json();
-  if (!data.access_token) throw new Error('Failed to get Firebase access token');
+  if (!data.access_token) throw new Error('Failed Firebase token');
   return data.access_token;
 }
 
-// ---------------- FIRESTORE HELPERS ----------------
-function toFirestoreValue(val) {
-  if (typeof val === 'number') return { doubleValue: val };
-  if (typeof val === 'boolean') return { booleanValue: val };
-  if (Array.isArray(val)) return { arrayValue: { values: val.map(toFirestoreValue) } };
-  if (val !== null && typeof val === 'object')
-    return { mapValue: { fields: Object.fromEntries(Object.entries(val).map(([k, v]) => [k, toFirestoreValue(v)])) } };
-  return { stringValue: String(val ?? '') };
+// ---------------- FIRESTORE ----------------
+function toFirestore(v) {
+  if (Array.isArray(v)) return { arrayValue: { values: v.map(toFirestore) } };
+  if (typeof v === 'object' && v !== null) {
+    return {
+      mapValue: {
+        fields: Object.fromEntries(
+          Object.entries(v).map(([k, val]) => [k, toFirestore(val)])
+        ),
+      },
+    };
+  }
+  return { stringValue: String(v ?? '') };
 }
 
-function toFirestoreFields(obj) {
-  const fields = {};
-  for (const key in obj) fields[key] = toFirestoreValue(obj[key]);
-  return fields;
-}
-
-async function firestoreCreate(collection, data, token) {
+async function createDoc(collection, data, token) {
   const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${collection}`;
 
   const res = await fetch(url, {
@@ -126,37 +122,34 @@ async function firestoreCreate(collection, data, token) {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ fields: toFirestoreFields(data) }),
+    body: JSON.stringify({ fields: Object.fromEntries(
+      Object.entries(data).map(([k,v]) => [k, toFirestore(v)])
+    )}),
   });
 
-  const result = await res.json();
-  if (!res.ok) throw new Error(JSON.stringify(result));
+  const json = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(json));
 
-  return result.name.split('/').pop();
+  return json.name.split('/').pop();
 }
 
-// ---------------- SHOPPING LIST ----------------
-async function createShoppingItem(item, userId, token) {
-  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/ShoppingList`;
+async function updateDoc(path, data, token) {
+  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${path}`;
 
-  const body = {
-    fields: {
-      Name: { stringValue: item.name || '' },
-      Cost: { integerValue: String(item.cost || 0) },
-      Description: { stringValue: item.description || '' },
-      userID: buildUserRef(userId),
-      TotalCost: { integerValue: String(item.cost || 0) }
-    }
-  };
-
-  await fetch(url, {
-    method: 'POST',
+  const res = await fetch(url, {
+    method: 'PATCH',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      fields: Object.fromEntries(
+        Object.entries(data).map(([k,v]) => [k, toFirestore(v)])
+      ),
+    }),
   });
+
+  if (!res.ok) throw new Error(await res.text());
 }
 
 // ---------------- OPENAI ----------------
@@ -166,47 +159,30 @@ function buildMessages(input) {
       role: 'system',
       content: `
 You are a Nigerian meal planner.
-
-Generate:
-1. 7-day meal plan (breakfast, lunch, dinner)
-2. missing_ingredients based on available ingredients
-
-Return JSON ONLY:
-{
-  "weekly_meal_plan": {...},
-  "missing_ingredients": [
-    {
-      "name": "",
-      "cost": 0,
-      "description": ""
-    }
-  ]
-}
-      `.trim(),
+Return 7-day meal plan.
+Include ingredients_used and missing_ingredients based on available ingredients.
+      `,
     },
     { role: 'user', content: JSON.stringify(input) },
   ];
 }
 
-// ---------------- MAIN LOGIC ----------------
-async function processInBackground(payload) {
+// ---------------- MAIN ----------------
+async function process(payload) {
   try {
     const token = await getAccessToken();
 
-    // 1️⃣ CREATE TIMETABLE (FIXED USER FIELD)
-    const timetableId = await firestoreCreate(
-      'Timetable',
-      {
-        user: buildUserRef(payload.userId),
-        status: 'creating',
-        created_at: new Date().toISOString()
-      },
-      token
-    );
+    // 1. Create timetable
+    const timetableId = await createDoc('Timetable', {
+      userId: payload.userId,              // string
+      user: userRef(payload.userId),       // reference
+      status: 'creating',
+      created_at: new Date().toISOString(),
+    }, token);
 
-    console.log('📄 Timetable created:', timetableId);
+    console.log("Timetable ID:", timetableId);
 
-    // 2️⃣ OPENAI CALL
+    // 2. OpenAI
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -216,59 +192,39 @@ async function processInBackground(payload) {
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         messages: buildMessages(payload),
-        max_tokens: 7000,
       }),
     });
 
     const raw = await res.text();
-    const parsed = JSON.parse(JSON.parse(raw).choices[0].message.content);
+    const json = JSON.parse(raw);
 
-    const week = parsed.weekly_meal_plan;
-    const missing = parsed.missing_ingredients || [];
+    const plan = JSON.parse(json.choices[0].message.content);
 
-    console.log('✅ OpenAI processed');
-
-    // 3️⃣ SAVE TIMETABLE
-    await firestoreCreate(`Timetable/${timetableId}`, {
+    // 3. Update timetable
+    await updateDoc(`Timetable/${timetableId}`, {
       status: 'completed',
-      updated_at: new Date().toISOString()
+      plan,
     }, token);
 
-    console.log('✅ Timetable saved');
-
-    // 4️⃣ CREATE SHOPPING LIST ITEMS
-    console.log('🛒 Creating shopping list...');
-
-    for (const item of missing) {
-      await createShoppingItem(item, payload.userId, token);
-    }
-
-    console.log('✅ Shopping list created');
-
-    // 5️⃣ TRIGGER IMAGE WORKER
+    // 4. Trigger image worker
     await fetch(IMAGE_WORKER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         timetableId,
-        promptsByDay: parsed.promptsByDay || {}
+        promptsByDay: plan.promptsByDay || {}
       }),
     });
 
-    console.log('🖼️ Image worker triggered');
-
-  } catch (err) {
-    console.error('❌ Error:', err.message);
+  } catch (e) {
+    console.error("ERROR:", e.message);
   }
 }
 
 // ---------------- ROUTE ----------------
 app.post('/generate-timetable', (req, res) => {
-  if (!req.body?.userId) return res.status(400).json({ error: 'userId required' });
-
   res.json({ status: 'processing' });
-  processInBackground(req.body);
+  process(req.body);
 });
 
-// ---------------- START ----------------
-app.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
+app.listen(PORT, () => console.log("Server running"));
