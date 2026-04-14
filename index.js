@@ -393,19 +393,19 @@ for (const day of days) {
     console.log(`   → ${items.length} unique items, Total Cost: ₦${totalCost}`);
 
     // 7️⃣ Call WaveSpeed / image worker
-    console.log('🖼️ Triggering image generation via WaveSpeed worker...');
-    try {
-      const waveRes = await fetch(IMAGE_WORKER_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timetableId, promptsByDay }),
-      });
-      console.log(`📡 WaveSpeed worker called. Status: ${waveRes.status}`);
-      const waveText = await waveRes.text();
-      console.log('📥 WaveSpeed response body:', waveText);
-    } catch (err) {
-      console.error('❌ Failed to call WaveSpeed worker:', err.message);
-    }
+    //console.log('🖼️ Triggering image generation via WaveSpeed worker...');
+    //try {
+      //const waveRes = await fetch(IMAGE_WORKER_URL, {
+        //method: 'POST',
+        //headers: { 'Content-Type': 'application/json' },
+        //body: JSON.stringify({ timetableId, promptsByDay }),
+      //});
+      //console.log(`📡 WaveSpeed worker called. Status: ${waveRes.status}`);
+      //const waveText = await waveRes.text();
+      //console.log('📥 WaveSpeed response body:', waveText);
+    //} catch (err) {
+      //console.error('❌ Failed to call WaveSpeed worker:', err.message);
+    //}
 
     console.log('🚀 processInBackground complete');
   } catch (err) {
