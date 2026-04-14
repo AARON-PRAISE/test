@@ -341,20 +341,14 @@ async function processInBackground(payload) {
 
     const openAIResult = JSON.parse(raw);
     const content = openAIResult.choices[0].message.content;
- const cleaned = content
-  .replace(/```json|```/g, '')
-  .replace(/[\u0000-\u001F\u007F]/g, (char) => {
-    // Preserve legitimate escape sequences
-    switch (char) {
-      case '\n': return '\\n';
-      case '\r': return '\\r';
-      case '\t': return '\\t';
-      default: return '';
-    }
-  })
-  .trim();
+ let jsonStr = content.replace(/```json|```/g, '').trim();
 
-const parsed = JSON.parse(cleaned);
+// Extract just the JSON object, ignoring any text before or after
+const firstBrace = jsonStr.indexOf('{');
+const lastBrace = jsonStr.lastIndexOf('}');
+jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
+
+const parsed = JSON.parse(jsonStr);
     const week = parsed.weekly_meal_plan;
 
     // 3️⃣ Validate week
