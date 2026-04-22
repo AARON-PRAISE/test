@@ -299,6 +299,7 @@ function buildDay(day, imagePromptMap, dayName) {
           ? [{ key: `${P}Step9`, prompt: m.image_prompts.step_9 }]
           : []),
       ];
+      console.log(`🔍 Prompts for ${dayName} ${P}:`, JSON.stringify(imagePromptMap[dayName][P]));
     }
   }
   return out;
