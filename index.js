@@ -133,8 +133,7 @@ async function firestoreCreate(collection, data, token) {
   });
   const result = await res.json();
   if (!res.ok) throw new Error(`Firestore create failed: ${JSON.stringify(result)}`);
-  const docName = result.name;
-  return docName.split('/').pop();
+  return result.name.split('/').pop();
 }
 
 async function firestoreUpdate(docPath, data, token) {
@@ -152,7 +151,6 @@ async function firestoreUpdate(docPath, data, token) {
 }
 
 // ---------------- FIRESTORE QUERY ----------------
-// Query all Timetable docs for a given userId, returns array of doc IDs
 async function firestoreQueryTimetablesByUser(userId, token) {
   const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`;
 
@@ -167,7 +165,7 @@ async function firestoreQueryTimetablesByUser(userId, token) {
         },
       },
       select: {
-        fields: [{ fieldPath: '__name__' }], // only fetch doc ID, nothing else
+        fields: [{ fieldPath: '__name__' }],
       },
     },
   };
@@ -184,12 +182,9 @@ async function firestoreQueryTimetablesByUser(userId, token) {
   const results = await res.json();
   if (!res.ok) throw new Error(`Firestore query failed: ${JSON.stringify(results)}`);
 
-  // Extract doc IDs, filter out empty results (Firestore returns one empty result when no docs found)
-  const docIds = results
+  return results
     .filter((r) => r.document?.name)
     .map((r) => r.document.name.split('/').pop());
-
-  return docIds;
 }
 
 // ---------------- HELPERS ----------------
@@ -278,8 +273,6 @@ function buildDay(day, imagePromptMap, dayName) {
     const m = day[type];
     const P = type.charAt(0).toUpperCase() + type.slice(1);
 
-    // additional_ingredients_to_buy is array of { name, cost, description }
-    // For Timetable fields we only store the names as a string array
     const missingIngredients = Array.isArray(m.additional_ingredients_to_buy)
       ? m.additional_ingredients_to_buy.map((i) =>
           typeof i === 'object' ? String(i.name || '') : String(i)
@@ -289,14 +282,13 @@ function buildDay(day, imagePromptMap, dayName) {
     out[`${P}Name`] = m.name ?? '';
     out[`${P}Description`] = m.description ?? '';
     out[`${P}Ingredients`] = ensureArray(m.ingredients_used);
-    out[`MissingIngredients${P}`] = missingIngredients; // ✅ string array of names only
+    out[`MissingIngredients${P}`] = missingIngredients;
     out[`${P}Instructions`] = exactly12(m.instructions);
     out[`${P}Equipment`] = ensureArray(m.equipment);
     out[`${type}cost`] = Number(m.estimated_cost) || 0;
     out[`${P}Image`] = '';
     out[`${P}InstructionImages`] = [];
 
-    // Extract image prompts for worker
     if (m.image_prompts) {
       if (!imagePromptMap[dayName]) imagePromptMap[dayName] = {};
       imagePromptMap[dayName][P] = [
@@ -313,13 +305,10 @@ function buildDay(day, imagePromptMap, dayName) {
 }
 
 // ---------------- SHOPPING LIST BUILDER ----------------
-// Collects additional_ingredients_to_buy objects from all 21 meals,
-// deduplicates by name (case-insensitive), sums TotalCost.
 function buildShoppingList(week) {
   const dayKeys = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
   const mealTypes = ['breakfast', 'lunch', 'dinner'];
-
-  const seen = new Map(); // name (lowercase) -> { Name, Cost, Description }
+  const seen = new Map();
 
   for (const day of dayKeys) {
     for (const meal of mealTypes) {
@@ -330,11 +319,8 @@ function buildShoppingList(week) {
 
       for (const item of items) {
         if (typeof item !== 'object' || !item.name) continue;
-
         const key = String(item.name).toLowerCase().trim();
         if (!key) continue;
-
-        // First occurrence wins for deduplication
         if (!seen.has(key)) {
           seen.set(key, {
             Name: String(item.name || ''),
@@ -348,7 +334,6 @@ function buildShoppingList(week) {
 
   const items = Array.from(seen.values());
   const totalCost = items.reduce((sum, i) => sum + i.Cost, 0);
-
   return { totalCost, items };
 }
 
@@ -357,13 +342,13 @@ async function processInBackground(payload) {
   try {
     const token = await getAccessToken();
 
-    // 1️⃣ Create new Timetable doc — Recent: true by default
+    // 1️⃣ Create new Timetable doc — Recent: true, status: 'creating'
     const timetableId = await firestoreCreate(
       'Timetable',
       {
         userId: payload.userId,
         user: { __type: 'reference', path: `users/${payload.userId}` },
-        status: 'creating',
+        status: 'creating',  // ✅ image worker will set this to 'completed'
         Recent: true,
         created_at: new Date().toISOString(),
       },
@@ -371,7 +356,7 @@ async function processInBackground(payload) {
     );
     console.log('📄 Timetable doc created with ID:', timetableId);
 
-    // 2️⃣ Query all Timetable docs for this user, set all OTHERS to Recent: false
+    // 2️⃣ Set all OTHER Timetable docs for this user to Recent: false
     console.log('🔍 Querying existing Timetable docs for user:', payload.userId);
     const allDocIds = await firestoreQueryTimetablesByUser(payload.userId, token);
     const otherDocIds = allDocIds.filter((id) => id !== timetableId);
@@ -406,7 +391,6 @@ async function processInBackground(payload) {
     const openAIResult = JSON.parse(raw);
     const content = openAIResult.choices[0].message.content;
 
-    // Extract just the JSON object, ignoring any text before or after
     let jsonStr = content.replace(/```json|```/g, '').trim();
     const firstBrace = jsonStr.indexOf('{');
     const lastBrace = jsonStr.lastIndexOf('}');
@@ -428,7 +412,7 @@ async function processInBackground(payload) {
       Thursday: buildDay(week.thursday, promptsByDay, 'Thursday'),
       Friday: buildDay(week.friday, promptsByDay, 'Friday'),
       Saturday: buildDay(week.saturday, promptsByDay, 'Saturday'),
-      // ✅ status NOT updated here — image worker will set it to 'completed'
+      // ✅ status intentionally NOT set here — image worker sets it to 'completed'
       updated_at: new Date().toISOString(),
     };
     console.log('🛠️ Timetable data built. Prompts extracted for image generation');
@@ -437,34 +421,34 @@ async function processInBackground(payload) {
     await firestoreUpdate(`Timetable/${timetableId}`, timetableData, token);
     console.log('✅ Meal plan saved to Firestore:', timetableId);
 
-    // 7️⃣ Build ShoppingList from all 21 meals' missing ingredients and save
+    // 7️⃣ Build and save ShoppingList
     console.log('🛒 Building ShoppingList from missing ingredients across all 21 meals...');
     const { totalCost, items } = buildShoppingList(week);
 
     const shoppingListData = {
       TotalCost: totalCost,
       userID: { __type: 'reference', path: `users/${payload.userId}` },
-      Detail: items, // List of { Name, Cost, Description }
+      Detail: items,
     };
 
     const shoppingListId = await firestoreCreate('ShoppingList', shoppingListData, token);
     console.log('✅ ShoppingList saved to Firestore:', shoppingListId);
     console.log(`   → ${items.length} unique items, Total Cost: ₦${totalCost}`);
 
-    // 8️⃣ Call WaveSpeed / image worker
-     console.log('🖼️ Triggering image generation via WaveSpeed worker...');
-     try {
-       const waveRes = await fetch(IMAGE_WORKER_URL, {
-         method: 'POST',
-         headers: { 'Content-Type': 'application/json' },
-         body: JSON.stringify({ timetableId, promptsByDay }),
-       });
-       console.log(`📡 WaveSpeed worker called. Status: ${waveRes.status}`);
-       const waveText = await waveRes.text();
-       console.log('📥 WaveSpeed response body:', waveText);
-     } catch (err) {
-       console.error('❌ Failed to call WaveSpeed worker:', err.message);
-     }
+    // 8️⃣ Call image worker — passes timetableId and all prompts
+    console.log('🖼️ Triggering image generation via WaveSpeed worker...');
+    try {
+      const waveRes = await fetch(IMAGE_WORKER_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timetableId, promptsByDay }),
+      });
+      console.log(`📡 WaveSpeed worker called. Status: ${waveRes.status}`);
+      const waveText = await waveRes.text();
+      console.log('📥 WaveSpeed response body:', waveText);
+    } catch (err) {
+      console.error('❌ Failed to call WaveSpeed worker:', err.message);
+    }
 
     console.log('🚀 processInBackground complete');
   } catch (err) {
@@ -475,8 +459,6 @@ async function processInBackground(payload) {
 // ---------------- ROUTE ----------------
 app.post('/generate-timetable', (req, res) => {
   if (!req.body?.userId) return res.status(400).json({ error: 'userId required' });
-
-  // availableIngredients is optional — defaults to [] in buildMessages
   res.json({ success: true, status: 'processing' });
   processInBackground(req.body);
 });
