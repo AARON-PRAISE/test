@@ -201,7 +201,59 @@ function ensureArray(v) {
 }
 
 // ---------------- OPENAI PROMPT ----------------
-function buildMessages(input) { const availableIngredients = input.availableIngredients || []; return [ { role: 'system', content: You are a professional Nigerian meal planner. Generate a COMPLETE 7-day meal plan. The user has these ingredients already available: ${JSON.stringify(availableIngredients)} For EACH day (Sunday–Saturday) and EACH meal (breakfast, lunch, dinner), generate: - name - description - ingredients_used: string array of ALL ingredients needed for this meal - additional_ingredients_to_buy: array of OBJECTS for ingredients NOT found in the available list above. Each object MUST have exactly these fields: { "name": string, "cost": integer (in Naira), "description": string } IMPORTANT: Only include ingredients the user does NOT already have. If the user has all ingredients, return an empty array []. - instructions: string array of 9 to 12 steps - equipment: string array - estimated_cost: integer in Naira - image_prompts: - food - step_1 - step_5 - step_9 (only if step 9 exists) Rules: - Nigerian meals only - Photorealistic food images - Append "low quality" to ALL image prompts - Return ONLY valid JSON with no extra text, no markdown, no code fences - DO NOT omit any day or any meal - additional_ingredients_to_buy MUST be an array of objects, NEVER an array of strings Required JSON structure: { "weekly_meal_plan": { "sunday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "monday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "tuesday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "wednesday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "thursday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "friday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "saturday": { "breakfast": {}, "lunch": {}, "dinner": {} } } } .trim(), }, { role: 'user', content: JSON.stringify(input) }, ]; }
+function buildMessages(input) {
+  const availableIngredients = input.availableIngredients || [];
+
+  return [
+    {
+      role: 'system',
+      content: `
+You are a professional Nigerian meal planner. Generate a COMPLETE 7-day meal plan.
+
+The user has these ingredients already available: ${JSON.stringify(availableIngredients)}
+
+For EACH day (Sunday–Saturday) and EACH meal (breakfast, lunch, dinner), generate:
+- name
+- description
+- ingredients_used: string array of ALL ingredients needed for this meal
+- additional_ingredients_to_buy: array of OBJECTS for ingredients NOT found in the available list above.
+    Each object MUST have exactly these fields:
+    { "name": string, "cost": integer (in Naira), "description": string }
+    IMPORTANT: Only include ingredients the user does NOT already have. If the user has all ingredients, return an empty array [].
+- instructions: string array of 9 to 12 steps
+- equipment: string array
+- estimated_cost: integer in Naira
+- image_prompts:
+    - food
+    - step_1
+    - step_5
+    - step_9 (only if step 9 exists)
+
+Rules:
+- Nigerian meals only
+- Photorealistic food images
+- Append "low quality" to ALL image prompts
+- Return ONLY valid JSON with no extra text, no markdown, no code fences
+- DO NOT omit any day or any meal
+- additional_ingredients_to_buy MUST be an array of objects, NEVER an array of strings
+
+Required JSON structure:
+{
+  "weekly_meal_plan": {
+    "sunday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "monday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "tuesday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "wednesday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "thursday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "friday": { "breakfast": {}, "lunch": {}, "dinner": {} },
+    "saturday": { "breakfast": {}, "lunch": {}, "dinner": {} }
+  }
+}
+      `.trim(),
+    },
+    { role: 'user', content: JSON.stringify(input) },
+  ];
+}
 
 // ---------------- VALIDATION ----------------
 function validateWeek(week) {
@@ -247,7 +299,6 @@ function buildDay(day, imagePromptMap, dayName) {
           ? [{ key: `${P}Step9`, prompt: m.image_prompts.step_9 }]
           : []),
       ];
-      console.log(`🔍 Prompts for ${dayName} ${P}:`, JSON.stringify(imagePromptMap[dayName][P]));
     }
   }
   return out;
