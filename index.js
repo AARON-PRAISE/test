@@ -201,62 +201,7 @@ function ensureArray(v) {
 }
 
 // ---------------- OPENAI PROMPT ----------------
-function buildMessages(input) {
-  const availableIngredients = input.availableIngredients || [];
-
-  return [
-    {
-      role: 'system',
-      content: `
-You are a professional Nigerian meal planner.
-
-Return ONLY valid JSON. No text, no markdown.
-
-STRICT RULE: You MUST follow the schema EXACTLY. Do not rename keys.
-
-image_prompts MUST be an OBJECT with EXACT keys:
-{
-  "food": string,
-  "step_1": string,
-  "step_5": string,
-  "step_9": string
-}
-
-All values MUST be non-empty strings.
-Append "low quality" to ALL image prompts.
-
-If step 9 does not exist, still include "step_9" with a valid prompt.
-
-Each meal MUST contain:
-- name
-- description
-- ingredients_used (array)
-- additional_ingredients_to_buy (array of objects: {name, cost, description})
-- instructions (9–12 steps)
-- equipment (array)
-- estimated_cost (integer)
-- image_prompts (STRICT OBJECT ABOVE)
-
-Return EXACT structure:
-
-{
-  "weekly_meal_plan": {
-    "sunday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "monday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "tuesday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "wednesday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "thursday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "friday": { "breakfast": {}, "lunch": {}, "dinner": {} },
-    "saturday": { "breakfast": {}, "lunch": {}, "dinner": {} }
-  }
-}
-
-User ingredients: ${JSON.stringify(availableIngredients)}
-      `.trim(),
-    },
-    { role: 'user', content: JSON.stringify(input) },
-  ];
-}
+function buildMessages(input) { const availableIngredients = input.availableIngredients || []; return [ { role: 'system', content: You are a professional Nigerian meal planner. Generate a COMPLETE 7-day meal plan. The user has these ingredients already available: ${JSON.stringify(availableIngredients)} For EACH day (Sunday–Saturday) and EACH meal (breakfast, lunch, dinner), generate: - name - description - ingredients_used: string array of ALL ingredients needed for this meal - additional_ingredients_to_buy: array of OBJECTS for ingredients NOT found in the available list above. Each object MUST have exactly these fields: { "name": string, "cost": integer (in Naira), "description": string } IMPORTANT: Only include ingredients the user does NOT already have. If the user has all ingredients, return an empty array []. - instructions: string array of 9 to 12 steps - equipment: string array - estimated_cost: integer in Naira - image_prompts: - food - step_1 - step_5 - step_9 (only if step 9 exists) Rules: - Nigerian meals only - Photorealistic food images - Append "low quality" to ALL image prompts - Return ONLY valid JSON with no extra text, no markdown, no code fences - DO NOT omit any day or any meal - additional_ingredients_to_buy MUST be an array of objects, NEVER an array of strings Required JSON structure: { "weekly_meal_plan": { "sunday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "monday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "tuesday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "wednesday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "thursday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "friday": { "breakfast": {}, "lunch": {}, "dinner": {} }, "saturday": { "breakfast": {}, "lunch": {}, "dinner": {} } } } .trim(), }, { role: 'user', content: JSON.stringify(input) }, ]; }
 
 // ---------------- VALIDATION ----------------
 function validateWeek(week) {
